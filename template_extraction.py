@@ -1,3 +1,9 @@
+# -*- coding: utf-8 -*-
+# @Author: shangerxin
+# @Date:   2019-12-30
+# @Last Modified by:   shangerxin
+# @Last Modified time: 2019-12-30
+
 import re
 from collections import defaultdict
 
@@ -55,6 +61,13 @@ def remap_eos_states(top_temps, temps2sents):
             del temps2sents[temp]
 
 def just_state2phrases(temps, temps2sents):
+    """
+    Args:
+        temps: list of string
+        temps2sents: dict
+    Return:
+        state2phrases: dict, key是模板编号，value的第一项是list，表示这个模板编号对应所有可能的模板，第二项是一个tensor，所有模板的编码
+    """
     state2phrases = defaultdict(lambda: defaultdict(int)) # defaultdict of defaultdict
     for temp in temps:
         for sent, lineno in temps2sents[temp]:
@@ -73,9 +86,27 @@ def just_state2phrases(temps, temps2sents):
 
 
 def extract_from_tagged_data(datadir, bsz, thresh, tagged_fi, ntemplates):
+    """
+    Args:
+        datadir: str
+        bsz: int
+        thresh: int
+        tagged_fi: str
+        ntemplates: int
+    Return:
+        top_temps: list of tuple(str) # [(55, 59, 43, 11, 25, 40, 53, 19)]，每一个数字代表一个state
+        temps2sents: dict, key string见top_temps单项, value [(phrase-list, lineno), ...]phrase-list表明这个模板有几个词，len(phrase-list) == len(k)
+                比如，k=(55, 59, 43, 11, 25, 40, 53, 19), 
+                    v=[(['<unk> Cambridge', 'is', 'high', 'priced', 'English', 'food', ',', 'that is', 'average', 'customer rated', '.', '<eos>'], 5701)]
+                    在这里55对应的是<unk> Cambridge，但是它还可以对应 '<unk> <unk> <unk>'，'<unk> <unk>', '<unk> of Cambridge', 'The <unk>', 'the <unk>', '<unk> Cambridge', 'The <unk> <unk>', '<unk>' 
+        state2phrases: dict key是state编号，value的第一项是list，表示这个模板编号对应所有可能的模板，第二项是一个tensor，所有模板的编码
+                还是以55为例，它对应9个模板，55对应的向量tensor([长度是9]))
+
+    """
     corpus = labeled_data.SentenceCorpus(datadir, bsz, thresh=thresh, add_bos=False,
                                          add_eos=False, test=False)
     nskips = 0
+    # 丢掉少于4个字的
     for i in xrange(len(corpus.train)):
         if corpus.train[i][0].size(0) <= 4:
             nskips += corpus.train[i][0].size(1)
