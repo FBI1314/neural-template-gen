@@ -1,3 +1,9 @@
+# -*- coding: utf-8 -*-
+# @Author: shangerxin
+# @Date:   2019-12-30
+# @Last Modified by:   shangerxin
+# @Last Modified time: 2019-12-30
+
 import sys
 import os
 import math
@@ -15,44 +21,55 @@ import labeled_data
 from utils import logsumexp1, make_fwd_constr_idxs, make_bwd_constr_idxs, backtrace3, backtrace
 from data.utils import get_wikibio_poswrds, get_e2e_poswrds
 import infc
-
+import pdb
 
 class HSMM(nn.Module):
     """
     standard hsmm
     """
     def __init__(self, wordtypes, gentypes, opt):
+        """
+        Args:
+            wordtypes: int总词表数
+            gentypes: int生成类别数
+            opt:parser.args 参数
+        """
         super(HSMM, self).__init__()
         self.K = opt.K
         self.Kmul = opt.Kmul
         self.L = opt.L
         self.A_dim = opt.A_dim
-        self.unif_lenps = opt.unif_lenps
+        self.unif_lenps = opt.unif_lenps # 训练阶段是true
+        # 状态转移矩阵也作为训练参数
         self.A_from = nn.Parameter(torch.Tensor(opt.K*opt.Kmul, opt.A_dim))
         self.A_to = nn.Parameter(torch.Tensor(opt.A_dim, opt.K*opt.Kmul))
         if self.unif_lenps:
+
             self.len_scores = nn.Parameter(torch.ones(1, opt.L))
             self.len_scores.requires_grad = False
         else:
             self.len_decoder = nn.Linear(2*opt.A_dim, opt.L)
 
-        self.yes_self_trans = opt.yes_self_trans
+        self.yes_self_trans = opt.yes_self_trans # 训练阶段是False
         if not self.yes_self_trans:
-            selfmask = torch.Tensor(opt.K*opt.Kmul).fill_(-float("inf"))
+            selfmask = torch.Tensor(opt.K*opt.Kmul).fill_(-float("inf")) #tensor([-inf, -inf, -inf, -inf, -inf, -inf, -inf, -inf, -inf, -inf])
+            # nn.Module一个方法, 保存模型参数，不会随opt.step发生变化，在forward中更新
             self.register_buffer('selfmask', Variable(torch.diag(selfmask), requires_grad=False))
 
         self.max_pool = opt.max_pool
         self.emb_size, self.layers, self.hid_size = opt.emb_size, opt.layers, opt.hid_size
         self.pad_idx = opt.pad_idx
+        # lookuptabel
         self.lut = nn.Embedding(wordtypes, opt.emb_size, padding_idx=opt.pad_idx)
-        self.mlpinp = opt.mlpinp
-        self.word_ar = opt.word_ar
+        self.mlpinp = opt.mlpinp # 训练阶段true
+        self.word_ar = opt.word_ar 
         self.ar = False
         inp_feats = 4
         sz_mult = opt.mlp_sz_mult
         if opt.mlpinp:
             rnninsz = sz_mult*opt.emb_size
             mlpinp_sz = inp_feats*opt.emb_size
+            # 按照顺序，先执行线性，再加一个ReLU激活函数
             self.inpmlp = nn.Sequential(nn.Linear(mlpinp_sz, sz_mult*opt.emb_size),
                                         nn.ReLU())
         else:
@@ -75,11 +92,12 @@ class HSMM(nn.Module):
                 self.seg_rnns.append(nn.LSTM(rnninsz, opt.hid_size,
                                              opt.layers, dropout=opt.dropout))
         self.ar_rnn = nn.LSTM(opt.emb_size, opt.hid_size, opt.layers, dropout=opt.dropout)
-
+        # 线性函数 y=wx+b 的实现
+        # 输入emb_size，输出2*hid_size
         self.h0_lin = nn.Linear(opt.emb_size, 2*opt.hid_size)
         self.state_att_gates = nn.Parameter(torch.Tensor(opt.K, 1, 1, opt.hid_size))
         self.state_att_biases = nn.Parameter(torch.Tensor(opt.K, 1, 1, opt.hid_size))
-
+        # 生成阶段 sep_attntrue
         self.sep_attn = opt.sep_attn
         if self.sep_attn:
             self.state_att2_gates = nn.Parameter(torch.Tensor(opt.K, 1, 1, opt.hid_size))
@@ -97,10 +115,11 @@ class HSMM(nn.Module):
         self.drop = nn.Dropout(opt.dropout)
         self.emb_drop = opt.emb_drop
         self.initrange = opt.initrange
-        self.lsm = nn.LogSoftmax(dim=1)
+        self.lsm = nn.LogSoftmax(dim=1) # 输出小于0的数
         self.zeros = torch.Tensor(1, 1).fill_(-float("inf")) if opt.lse_obj else torch.zeros(1, 1)
         self.lse_obj = opt.lse_obj
-        if opt.cuda:
+        if False:
+        # if opt.cuda:
             self.zeros = self.zeros.cuda()
 
         # src encoder stuff
@@ -109,7 +128,8 @@ class HSMM(nn.Module):
 
         self.init_lin = nn.Linear(opt.emb_size, opt.K*opt.Kmul)
         self.cond_A_dim = opt.cond_A_dim
-        self.smaller_cond_dim = opt.smaller_cond_dim
+        self.smaller_cond_dim = opt.smaller_cond_dim # 训练阶段64
+        # 生成阶段 smaller_cond_dim 使用默认值64
         if opt.smaller_cond_dim > 0:
             self.cond_trans_lin = nn.Sequential(
                 nn.Linear(opt.emb_size, opt.smaller_cond_dim),
@@ -166,6 +186,7 @@ class HSMM(nn.Module):
         """
         args:
           uniqenc - bsz x emb_size
+          seqlen:
         returns:
           1 x K tensor and seqlen-1 x bsz x K x K tensor of log probabilities,
                            where lps[i] is p(q_{i+1} | q_i)
@@ -385,7 +406,7 @@ class HSMM(nn.Module):
     def encode(self, src, avgmask, uniqfields):
         """
         args:
-          src - bsz x nfields x nfeats
+          src - tensor, bsz x nfields x nfeats
           avgmask - bsz x nfields, with 0s for pad and 1/tru_nfields for rest
           uniqfields - bsz x maxfields
         returns bsz x emb_size, bsz x nfields x emb_size
@@ -393,6 +414,8 @@ class HSMM(nn.Module):
         bsz, nfields, nfeats = src.size()
         emb_size = self.lut.embedding_dim
         # do src stuff that depends on words
+        # view返回一个有相同数据但大小不同的tensor。 
+        # the size -1 is inferred from other dimensions 也不是很懂 ==
         embs = self.lut(src.view(-1, nfeats)) # bsz*nfields x nfeats x emb_size
         if self.max_pool:
             embs = F.relu(embs.sum(1) + self.src_bias.expand(bsz*nfields, emb_size))
@@ -580,10 +603,17 @@ class HSMM(nn.Module):
     def gen_one(self, templt, h0, c0, srcfieldenc, len_lps, row2tblent, row2feats):
         """
         src - 1 x nfields x nfeatures
+        templt - tuple of str(stateidx)
         h0 - rnn_size vector
         c0 - rnn_size vector
         srcfieldenc - 1 x nfields x dim
         len_lps - K x L, log normalized
+        Returns:
+            phrases: list of list(str词)
+            tote_wscore: float, 
+            tote_lscore: float,
+            tokes:int生成词个数, 
+            segs:生成了几个segment
         returns a list of phrases
         """
         phrases = []
@@ -592,9 +622,10 @@ class HSMM(nn.Module):
         start_inp = self.start_emb
         exh0 = h0.view(1, 1, self.hid_size).expand(self.layers, 1, self.hid_size)
         exc0 = c0.view(1, 1, self.hid_size).expand(self.layers, 1, self.hid_size)
-        nout_wrds = self.decoder.out_features
+        nout_wrds = self.decoder.out_features # gentypes+1
         i2w, w2i = corpus.dictionary.idx2word, corpus.dictionary.word2idx
         for stidx, k in enumerate(templt):
+            #  使用beamsearch得到
             phrs_idxs, wscore, lscore = self.temp_bs(corpus, k, start_inp, exh0, exc0,
                                                      srcfieldenc, len_lps, row2tblent, row2feats,
                                                      args.beamsz, final_state=(stidx == len(templt)-1))
@@ -605,11 +636,13 @@ class HSMM(nn.Module):
                 else:
                     tblidx = phrs_idxs[ii] - nout_wrds
                     _, _, wordstr = row2tblent[tblidx]
+                    # 生成阶段verbose为false
                     if args.verbose:
                         phrs.append(wordstr + " (c)")
                     else:
                         phrs.append(wordstr)
             if phrs[-1] == "<eos>":
+                print '第{}个state{}时，已经生成截至啦，当前模板一共有{}个state。tokes的值是{},segs值是{}. segs==stidx+1吗？{}'.format(stidx, k, len(templ), tokes, segs, segs==stidx+1)
                 break
             phrases.append(phrs)
             tote_wscore += wscore
@@ -622,6 +655,11 @@ class HSMM(nn.Module):
 
     def temp_ar_bs(self, templt, row2tblent, row2feats, h0, c0, srcfieldenc, len_lps,  K,
                 corpus):
+        """
+        Args:
+            K: int, beamsz
+            corpus:
+        """
         assert self.unif_lenps # ignoring lenps
         exh0 = h0.view(1, 1, self.hid_size).expand(self.layers, 1, self.hid_size)
         exc0 = c0.view(1, 1, self.hid_size).expand(self.layers, 1, self.hid_size)
@@ -632,9 +670,9 @@ class HSMM(nn.Module):
         unk_idx, eos_idx, pad_idx = w2i["<unk>"], w2i["<eos>"], w2i["<pad>"]
 
         curr_hyps = [(None, None, None)]
-        nfeats = 4
-        inps = Variable(torch.LongTensor(K, nfeats), volatile=True)
-        curr_scores, curr_lens, nulens = torch.zeros(K, 1), torch.zeros(K, 1), torch.zeros(K, 1)
+        nfeats = 4 # feat0表示属性值在词表的索引，feat1表示属性在词表的索引，feat2表示当前属性值的索引在词表的索引，feat4表示当前属性值是否是该属性最后一个在词表的索引
+        inps = Variable(torch.LongTensor(K, nfeats), volatile=True) # with size (5, 4)
+        curr_scores, curr_lens, nulens = torch.zeros(K, 1), torch.zeros(K, 1), torch.zeros(K, 1) # with size (60, 1)
         if self.lut.weight.data.is_cuda:
             inps = inps.cuda()
             curr_scores, curr_lens, nulens = curr_scores.cuda(), curr_lens.cuda(), nulens.cuda()
@@ -659,9 +697,11 @@ class HSMM(nn.Module):
 
             for ell in xrange(self.L+1):
                 new_hyps, anc_hs, anc_cs, anc_ths, anc_tcs = [], [], [], [], []
+                # 只保留了属性值本身，其他特征用ncf填充
                 inps.data[:, 1].fill_(w2i["<ncf1>"])
                 inps.data[:, 2].fill_(w2i["<ncf2>"])
                 inps.data[:, 3].fill_(w2i["<ncf3>"])
+                # print 'after fill inps.data.size():{}'.format(str(inps.data.size())) # 这时是 [K, nfeats]
 
                 wrd_dist = self.get_next_word_dist(hid + thid, rul_ss, srcfieldenc) # K x nwords
                 currK = wrd_dist.size(0)
@@ -697,6 +737,11 @@ class HSMM(nn.Module):
                         nulens[len(new_hyps)][0] = curr_lens[anc][0]+1
                         if wrd >= self.decoder.out_features: # a copy
                             tblidx = wrd - self.decoder.out_features
+                            if not isinstance(tblidx, int):
+                            # pytorch 1.3.0中tblidx是一个tensor类型的变量
+                            # 执行tolist之后竟然不是一个list而是一个int
+                                tblidx = tblidx.data.tolist()
+                            # tblidx = tblidx.data.tolist()[0]
                             inps.data[len(new_hyps)].copy_(row2feats[tblidx])
                         else:
                             inps.data[len(new_hyps)][0] = wrd if i2w[wrd] in genset else unk_idx
@@ -798,6 +843,8 @@ class HSMM(nn.Module):
                 phrs.append(i2w[widx])
             else:
                 tblidx = widx - nout_wrds
+                if not isinstance(tblidx, int):
+                    tblidx = tblidx.data.tolist()
                 _, _, wordstr = row2tblent[tblidx]
                 if args.verbose:
                     phrs.append(wordstr + " (c)")
@@ -819,7 +866,7 @@ def make_combo_targs(locs, x, L, nfields, ngen_types):
     """
     seqlen, bsz, max_locs = locs.size()
     # first replace -1s in first loc with target words
-    addloc = locs + (ngen_types+1) # seqlen x bsz x max_locs
+    addloc = locs + (ngen_types+1) # seqlen x bsz x max_locs #loc每一个数值增加ngen_types+1
     firstloc = addloc[:, :, 0] # seqlen x bsz
     targmask = (firstloc == ngen_types) # -1 will now have value ngentypes
     firstloc[targmask] = x[targmask]
@@ -831,13 +878,15 @@ def make_combo_targs(locs, x, L, nfields, ngen_types):
         newlocs[i][:seqlen-i].copy_(addloc[i:])
     return newlocs.transpose(1, 2).contiguous().view(L, bsz*seqlen, max_locs)
 
-
 def get_uniq_fields(src, pad_idx, keycol=0):
     """
     src - bsz x nfields x nfeats
+    Return:
+        fields:tensor bsz x maxkeys, 自己的unique类别索引+补齐的填充索引
     """
     bsz = src.size(0)
     # get unique keys for each example
+    # keycol=0表示类别索引
     keys = [torch.LongTensor(list(set(src[b, :, keycol]))) for b in xrange(bsz)]
     maxkeys = max(keyset.size(0) for keyset in keys)
     fields = torch.LongTensor(bsz, maxkeys).fill_(pad_idx)
@@ -845,94 +894,521 @@ def get_uniq_fields(src, pad_idx, keycol=0):
         fields[b][:len(keyset)].copy_(keyset)
     return fields
 
-
 def make_masks(src, pad_idx, max_pool=False):
     """
     src - bsz x nfields x nfeats
+    Return:
+        fieldmask: bsz * nfields
+        avgmask: bsz * nfields
     """
     neginf = -1e38
     bsz, nfields, nfeats = src.size()
+    # src 是有pad补齐的
+    # fieldmask形如 tensor([[False,  True,  True,  True, False, False]])
     fieldmask = (src.eq(pad_idx).sum(2) == nfeats) # binary bsz x nfields tensor
-    avgmask = (1 - fieldmask).float() # 1s where not padding
+    avgmask =  (~fieldmask).float() # 下面会报错py2.7+torch 1.3.1
+    # avgmask = (1 - fieldmask).float() # 1s where not padding
     if not max_pool:
-        avgmask.div_(avgmask.sum(1, True).expand(bsz, nfields))
+        avgmask.div_(avgmask.sum(1, True).expand(bsz, nfields)) 
     fieldmask = fieldmask.float() * neginf # 0 where not all pad and -1e38 elsewhere
     return fieldmask, avgmask
+def train(epoch):
+    # Turn on training mode which enables dropout.
+    net.train()
+    neglogev = 0.0 #  negative log evidence
+    nsents = 0
+    # 把一个batch的样本随机打乱
+    trainperm = torch.randperm(len(corpus.train))
+    nmini_batches = min(len(corpus.train), args.max_mbs_per_epoch)
+    for batch_idx in xrange(nmini_batches):
+        net.zero_grad()
+        # x: 词，seqlen x bsz
+        # _ label
+        # src生成的特征 bsz x nfields x nfeats
+        # locs生成句子每一个词对标数据的位置 seqlen x bsz x max_locs
+        # inps生成句子每一个词含有go、end的特征 seqlen x bsz x max_locs x nfeats
+        x, _, src, locs, inps = corpus.train[trainperm[batch_idx]]
+        cidxs = train_cidxs[trainperm[batch_idx]] if epoch <= args.constr_tr_epochs else None
 
-parser = argparse.ArgumentParser(description='')
-parser.add_argument('-data', type=str, default='', help='path to data dir')
-parser.add_argument('-epochs', type=int, default=40, help='upper epoch limit')
-parser.add_argument('-bsz', type=int, default=16, help='batch size')
-parser.add_argument('-seed', type=int, default=1111, help='random seed')
-parser.add_argument('-cuda', action='store_true', help='use CUDA')
-parser.add_argument('-log_interval', type=int, default=200,
-                    help='minibatches to wait before logging training status')
-parser.add_argument('-save', type=str, default='', help='path to save the final model')
-parser.add_argument('-load', type=str, default='', help='path to saved model')
-parser.add_argument('-test', action='store_true', help='use test data')
-parser.add_argument('-thresh', type=int, default=9, help='prune if occurs <= thresh')
-parser.add_argument('-max_mbs_per_epoch', type=int, default=35000, help='max minibatches per epoch')
+        seqlen, bsz = x.size() # torch.LongTensor(curr_batch).t().contiguous()
+        nfields = src.size(1)
+        if seqlen < args.L or seqlen > args.max_seqlen:
+            continue
+        # 把输入数据中的词如果也出现在生成文本中，就是copy，现在把每一个词和它的copy放到一个Tensor中
+        combotargs = make_combo_targs(locs, x, args.L, nfields, corpus.ngen_types)
+        # get bsz x nfields, bsz x nfields masks
+        fmask, amask = make_masks(src, args.pad_idx, max_pool=args.max_pool)
 
-parser.add_argument('-emb_size', type=int, default=100, help='size of word embeddings')
-parser.add_argument('-hid_size', type=int, default=100, help='size of rnn hidden state')
-parser.add_argument('-layers', type=int, default=1, help='num rnn layers')
-parser.add_argument('-A_dim', type=int, default=64,
-                    help='dim of factors if factoring transition matrix')
-parser.add_argument('-cond_A_dim', type=int, default=32,
-                    help='dim of factors if factoring transition matrix')
-parser.add_argument('-smaller_cond_dim', type=int, default=64,
-                    help='dim of thing we feed into linear to get transitions')
-parser.add_argument('-yes_self_trans', action='store_true', help='')
-parser.add_argument('-mlpinp', action='store_true', help='')
-parser.add_argument('-mlp_sz_mult', type=int, default=2, help='mlp hidsz is this x emb_size')
-parser.add_argument('-max_pool', action='store_true', help='for word-fields')
+        uniqfields = get_uniq_fields(src, args.pad_idx) # bsz x max_fields
 
-parser.add_argument('-constr_tr_epochs', type=int, default=100, help='')
-parser.add_argument('-no_ar_epochs', type=int, default=100, help='')
+        if args.cuda:
+            combotargs = combotargs.cuda()
+            if cidxs is not None:
+                cidxs = [tens.cuda() if tens is not None else None for tens in cidxs]
+            src = src.cuda()
+            inps = inps.cuda()
+            fmask, amask = fmask.cuda(), amask.cuda()
+            uniqfields = uniqfields.cuda()
 
-parser.add_argument('-word_ar', action='store_true', help='')
-parser.add_argument('-ar_after_decay', action='store_true', help='')
-parser.add_argument('-no_ar_for_vit', action='store_true', help='')
-parser.add_argument('-fine_tune', action='store_true', help='only train ar rnn')
+        srcenc, srcfieldenc, uniqenc = net.encode(Variable(src), Variable(amask), # bsz x hid
+                                                  Variable(uniqfields))
+        init_logps, trans_logps = net.trans_logprobs(uniqenc, seqlen) # bsz x K, T-1 x bsz x KxK
+        len_logprobs, _ = net.len_logprobs()
+        fwd_obs_logps = net.obs_logprobs(Variable(inps), srcenc, srcfieldenc, Variable(fmask),
+                                         Variable(combotargs), bsz) # L x T x bsz x K
+        # get T+1 x bsz x K beta quantities
+        beta, beta_star = infc.just_bwd(trans_logps, fwd_obs_logps,
+                                        len_logprobs, constraints=cidxs)
+        log_marg = logsumexp1(beta_star[0] + init_logps).sum() # bsz x 1 -> 1
+        neglogev -= log_marg.data[0]
+        lossvar = -log_marg/bsz
+        lossvar.backward()
+        torch.nn.utils.clip_grad_norm(net.parameters(), args.clip)
+        if optalg is not None:
+            optalg.step()
+        else:
+            for p in net.parameters():
+                if p.grad is not None:
+                    p.data.add_(-args.lr, p.grad.data)
 
-parser.add_argument('-dropout', type=float, default=0.3, help='dropout')
-parser.add_argument('-emb_drop', action='store_true', help='dropout on embeddings')
-parser.add_argument('-lse_obj', action='store_true', help='')
-parser.add_argument('-sep_attn', action='store_true', help='')
-parser.add_argument('-max_seqlen', type=int, default=70, help='')
+        nsents += bsz
 
-parser.add_argument('-K', type=int, default=10, help='number of states')
-parser.add_argument('-Kmul', type=int, default=1, help='number of states multiplier')
-parser.add_argument('-L', type=int, default=10, help='max segment length')
-parser.add_argument('-unif_lenps', action='store_true', help='')
-parser.add_argument('-one_rnn', action='store_true', help='')
+        if (batch_idx+1) % args.log_interval == 0:
+            print "batch %d/%d | train neglogev %g " % (batch_idx+1,
+                                                        nmini_batches,
+                                                        neglogev/nsents)
+    print "epoch %d | train neglogev %g " % (epoch, neglogev/nsents)
+    return neglogev/nsents
 
-parser.add_argument('-initrange', type=float, default=0.1, help='uniform init interval')
-parser.add_argument('-lr', type=float, default=1.0, help='initial learning rate')
-parser.add_argument('-lr_decay', type=float, default=0.5, help='learning rate decay')
-parser.add_argument('-optim', type=str, default="sgd", help='optimization algorithm')
-parser.add_argument('-onmt_decay', action='store_true', help='')
-parser.add_argument('-clip', type=float, default=5, help='gradient clipping')
-parser.add_argument('-interactive', action='store_true', help='')
-parser.add_argument('-label_train', action='store_true', help='')
-parser.add_argument('-gen_from_fi', type=str, default='', help='')
-parser.add_argument('-verbose', action='store_true', help='')
-parser.add_argument('-prev_loss', type=float, default=None, help='')
-parser.add_argument('-best_loss', type=float, default=None, help='')
+def test(epoch):
+    net.eval()
+    neglogev = 0.0
+    nsents = 0
 
-parser.add_argument('-tagged_fi', type=str, default='', help='path to tagged fi')
-parser.add_argument('-ntemplates', type=int, default=200, help='num templates for gen')
-parser.add_argument('-beamsz', type=int, default=1, help='')
-parser.add_argument('-gen_wts', type=str, default='1,1', help='')
-parser.add_argument('-min_gen_tokes', type=int, default=0, help='')
-parser.add_argument('-min_gen_states', type=int, default=0, help='')
-parser.add_argument('-gen_on_valid', action='store_true', help='')
-parser.add_argument('-align', action='store_true', help='')
-parser.add_argument('-wid_workers', type=str, default='', help='')
+    for i in xrange(len(corpus.valid)):
+        x, _, src, locs, inps = corpus.valid[i]
+        cidxs = None
+
+        seqlen, bsz = x.size()
+        nfields = src.size(1)
+        if seqlen < args.L or seqlen > args.max_seqlen:
+            continue
+
+        combotargs = make_combo_targs(locs, x, args.L, nfields, corpus.ngen_types)
+        # get bsz x nfields, bsz x nfields masks
+        fmask, amask = make_masks(src, args.pad_idx, max_pool=args.max_pool)
+
+        uniqfields = get_uniq_fields(src, args.pad_idx) # bsz x max_fields
+
+        if args.cuda:
+            combotargs = combotargs.cuda()
+            if cidxs is not None:
+                cidxs = [tens.cuda() if tens is not None else None for tens in cidxs]
+            src = src.cuda()
+            inps = inps.cuda()
+            fmask, amask = fmask.cuda(), amask.cuda()
+            uniqfields = uniqfields.cuda()
+
+        srcenc, srcfieldenc, uniqenc = net.encode(Variable(src, volatile=True),  # bsz x hid
+                                                  Variable(amask, volatile=True),
+                                                  Variable(uniqfields, volatile=True))
+        init_logps, trans_logps = net.trans_logprobs(uniqenc, seqlen) # bsz x K, T-1 x bsz x KxK
+        len_logprobs, _ = net.len_logprobs()
+        fwd_obs_logps = net.obs_logprobs(Variable(inps, volatile=True), srcenc,
+                                         srcfieldenc, Variable(fmask, volatile=True),
+                                         Variable(combotargs, volatile=True),
+                                         bsz) # L x T x bsz x K
+
+        # get T+1 x bsz x K beta quantities
+        beta, beta_star = infc.just_bwd(trans_logps, fwd_obs_logps,
+                                        len_logprobs, constraints=cidxs)
+        log_marg = logsumexp1(beta_star[0] + init_logps).sum() # bsz x 1 -> 1
+        neglogev -= log_marg.data[0]
+        nsents += bsz
+    print "epoch %d | valid ev %g" % (epoch, neglogev/nsents)
+    return neglogev/nsents
+
+def label_train():
+    net.ar = saved_args.ar_after_decay and not args.no_ar_for_vit
+    # print "btw, net.ar:", net.ar #true
+    for i in xrange(len(corpus.train)):
+        x, _, src, locs, inps = corpus.train[i]
+        fwd_cidxs = None
+
+        seqlen, bsz = x.size()
+        nfields = src.size(1)
+        if seqlen <= saved_args.L: #or seqlen > args.max_seqlen:
+            continue
+
+        combotargs = make_combo_targs(locs, x, saved_args.L, nfields, corpus.ngen_types)
+        # get bsz x nfields, bsz x nfields masks
+        fmask, amask = make_masks(src, saved_args.pad_idx, max_pool=saved_args.max_pool)
+        uniqfields = get_uniq_fields(src, args.pad_idx) # bsz x max_fields
+
+        if args.cuda:
+            combotargs = combotargs.cuda()
+            if fwd_cidxs is not None:
+                fwd_cidxs = [tens.cuda() if tens is not None else None for tens in fwd_cidxs]
+            src = src.cuda()
+            inps = inps.cuda()
+            fmask, amask = fmask.cuda(), amask.cuda()
+            uniqfields = uniqfields.cuda()
+        # 相当于requires_grad=False，适用于推断阶段，不需要反向传播
+        srcenc, srcfieldenc, uniqenc = net.encode(Variable(src, volatile=True), # bsz x hid
+                                                  Variable(amask, volatile=True),
+                                                  Variable(uniqfields, volatile=True))
+        init_logps, trans_logps = net.trans_logprobs(uniqenc, seqlen) # bsz x K, T-1 x bsz x KxK
+        len_logprobs, _ = net.len_logprobs()
+        fwd_obs_logps = net.obs_logprobs(Variable(inps, volatile=True), srcenc,
+                                         srcfieldenc, Variable(fmask, volatile=True),
+                                         Variable(combotargs, volatile=True), bsz) # LxTxbsz x K
+        bwd_obs_logprobs = infc.bwd_from_fwd_obs_logprobs(fwd_obs_logps.data)
+        seqs = infc.viterbi(init_logps.data, trans_logps.data, bwd_obs_logprobs,
+                            [t.data for t in len_logprobs], constraints=fwd_cidxs)
+        for b in xrange(bsz):
+            words = [corpus.dictionary.idx2word[w] for w in x[:, b]]
+            for (start, end, label) in seqs[b]:
+                print "%s|%d" % (" ".join(words[start:end]), label),
+            print
+
+def gen_from_srctbl(src_tbl, top_temps, coeffs, src_line=None):
+    """
+    Args:
+        src_tbl: dict, key is tuple like ('_name', 1), value is sm like The
+        top_temps: list of tuple(str)
+        coeffs: list of float
+        src_line: str
+    """
+    # 生成阶段 ar_after_decay是True
+    net.ar = saved_args.ar_after_decay
+    # print "gen_from_srctbl|||net.ar|||btw2", net.ar # true
+    i2w, w2i = corpus.dictionary.idx2word, corpus.dictionary.word2idx
+    best_score, best_phrases, best_templt = -float("inf"), None, None
+    best_len = 0
+    best_tscore, best_gscore = None, None
+
+    # get srcrow 2 key, idx
+    #src_b = src.narrow(0, b, 1) # 1 x nfields x nfeats
+    
+    src_b = corpus.featurize_tbl(src_tbl).unsqueeze(0) # 1 x nfields x nfeats 在0的位置进行扩维
+    uniq_b = get_uniq_fields(src_b, saved_args.pad_idx) # 1 x max_fields
+    if args.cuda:
+        src_b = src_b.cuda()
+        uniq_b = uniq_b.cuda()
+
+    srcenc, srcfieldenc, uniqenc = net.encode(Variable(src_b, volatile=True), None,
+                                              Variable(uniq_b, volatile=True))
+    init_logps, trans_logps = net.trans_logprobs(uniqenc, 2)
+    _, len_scores = net.len_logprobs()
+    # 进行一次logsoftmax
+    len_lps = net.lsm(len_scores).data
+    init_logps, trans_logps = init_logps.data.cpu(), trans_logps.data[0].cpu()
+    # 进行一次线性变换
+    inits = net.h0_lin(srcenc)
+    h0, c0 = F.tanh(inits[:, :inits.size(1)/2]), inits[:, inits.size(1)/2:]
+
+    nfields = src_b.size(1)
+    row2tblent = {} # 既然用索引做键值为什么不用数组？就像是corpus.idx2word
+    # 不是很明白，感觉是featurize_tbl的逆过程
+    for ff in xrange(nfields):
+        # 属性和索引都有编码
+        field, idx = i2w[src_b[0][ff][0]], i2w[src_b[0][ff][1]]
+        if (field, idx) in src_tbl:
+            # row2tblent 在ff索引的值是一个tuple 三个string('_name', '1', '尚') ('_name', '2', '尔')('_name', '1', '昕')
+            row2tblent[ff] = (field, idx, src_tbl[field, idx])
+        else:
+            row2tblent[ff] = (None, None, None)
+
+    # get row to input feats
+    row2feats = {}
+    # precompute wrd stuff
+    """
+    比如src_line是__start_name__ Alimentum __end_name__ __start_area__ city centre __end_area__ __start_familyFriendly__ no __end_familyFriendly__
+    那么fld_cntr就是{'_area': 2, '_familyFriendly': 1, '_name': 1}
+    row2tblent:{0: ('_area', 2, 'centre'), 1: ('_familyFriendly', 1, 'no'), 2: ('_area', 1, 'city'), 3: ('_name', 1, 'Alimentum')}
+    """
+    # 又进行了一次featurize_tbl？多了一个是否同一个属性的判断：go或者stop
+
+    
+    fld_cntr = Counter([key for key, _ in src_tbl])
+    for row, (k, idx, wrd) in row2tblent.iteritems():
+        # row表示第几个field，
+        if k in w2i:
+            widx = w2i[wrd] if wrd in w2i else w2i["<unk>"]
+            keyidx = w2i[k] if k in w2i else w2i["<unk>"]
+            idxidx = w2i[idx]
+            cheatfeat = w2i["<stop>"] if fld_cntr[k] == idx else w2i["<go>"]
+            #row2feats[row] = torch.LongTensor([keyidx, idxidx, cheatfeat])
+            row2feats[row] = torch.LongTensor([widx, keyidx, idxidx, cheatfeat])
+    """
+    仍以上面的src_line为例
+    row2feats:{0: tensor([694, 828, 781, 871]), 1: tensor([203, 862, 780, 871]), 2: tensor([286, 828, 780, 870]), 3: tensor([857, 855, 780, 871])}
+    """
+
+
+    constr_sat = False
+    # 每一个输出都是遍历了所有top模板的
+    # search over all templates
+    for templt in top_temps:
+        #print "templt is", templt
+        # get templt transition prob
+        tscores = [init_logps[0][templt[0]]]
+        # 从tt-1时刻到tt时刻，状态转移概率
+        [tscores.append(trans_logps[0][templt[tt-1]][templt[tt]])
+         for tt in xrange(1, len(templt))]
+
+        if net.ar:
+            phrases, wscore, tokes = net.gen_one_ar(templt, h0[0], c0[0], srcfieldenc,
+                len_lps, row2tblent, row2feats)
+            rul_tokes = tokes
+        else:
+            phrases, wscore, lscore, tokes, segs = net.gen_one(templt, h0[0], c0[0],
+                srcfieldenc, len_lps, row2tblent, row2feats)
+            rul_tokes = tokes - segs # subtract imaginary toke for each <eop> ？？
+            wscore /= tokes
+        segs = len(templt)
+        if (rul_tokes < args.min_gen_tokes or segs < args.min_gen_states) and constr_sat:
+            # print '不满足最小生成词数和类型数:{}'.format(str(templt))
+            continue
+        if rul_tokes >= args.min_gen_tokes and segs >= args.min_gen_states:
+            # print 'rul_tokes:{} >= args.min_gen_tokes:{} and segs:{} >= args.min_gen_states:{}'.format(rul_tokes, args.min_gen_tokes, segs, args.min_gen_states)
+            constr_sat = True # satisfied our constraint
+        tscore = sum(tscores[:int(segs)])/segs
+        if not net.unif_lenps:
+            tscore += lscore/segs
+
+        gscore = wscore
+        ascore = coeffs[0]*tscore + coeffs[1]*gscore
+        if (constr_sat and ascore > best_score) or (not constr_sat and rul_tokes > best_len) or (not constr_sat and rul_tokes == best_len and ascore > best_score):
+        # take if improves score or not long enough yet and this is longer...
+        #if ascore > best_score: #or (not constr_sat and rul_tokes > best_len):
+            best_score, best_tscore, best_gscore = ascore, tscore, gscore
+            best_phrases, best_templt = phrases, templt
+            best_len = rul_tokes
+        #str_phrases = [" ".join(phrs) for phrs in phrases]
+        #tmpltd = ["%s|%d" % (phrs, templt[k]) for k, phrs in enumerate(str_phrases)]
+        #statstr = "a=%.2f t=%.2f g=%.2f" % (ascore, tscore, gscore)
+        #print "%s|||%s" % (" ".join(str_phrases), " ".join(tmpltd)), statstr
+        #assert False
+    #assert False
+
+    try:
+        str_phrases = [" ".join(phrs) for phrs in best_phrases]
+    except TypeError:
+        # sometimes it puts an actual number in
+        str_phrases = [" ".join([str(n) if type(n) is int else n for n in phrs]) for phrs in best_phrases]
+    tmpltd = ["%s|%d" % (phrs, best_templt[kk]) for kk, phrs in enumerate(str_phrases)]
+    # 生成阶段为false
+    if args.verbose:
+        print src_line
+        #print src_tbl
+
+    print "%s|||%s" % (" ".join(str_phrases), " ".join(tmpltd))
+     # 生成阶段为false
+    if args.verbose:
+        statstr = "a=%.2f t=%.2f g=%.2f" % (best_score, best_tscore, best_gscore)
+        print statstr
+        print
+    #assert False
+
+def gen_from_src():
+    from template_extraction import extract_from_tagged_data, align_cntr
+    top_temps, _, _ = extract_from_tagged_data(args.data, args.bsz, args.thresh,
+                                               args.tagged_fi, args.ntemplates)
+
+    with open(args.gen_from_fi) as f:
+        src_lines = f.readlines()
+    # 生成阶段wid_workers为空
+    if len(args.wid_workers) > 0:
+        wid, nworkers = [int(n.strip()) for n in args.wid_workers.split(',')]
+        chunksz = math.floor(len(src_lines)/float(nworkers))
+        startln = int(wid*chunksz)
+        endln = int((wid+1)*chunksz) if wid < nworkers-1 else len(src_lines)
+        print >> sys.stderr, "worker", wid, "doing lines", startln, "thru", endln-1
+        src_lines = src_lines[startln:endln]
+    # dropout和batchnorm在train阶段、eval阶段是不一样的。仅仅当模型中有Dropout和BatchNorm是才会有影响。
+    net.eval()
+    # 生成阶段 coeffs = [1, 1]
+    coeffs = [float(flt.strip()) for flt in args.gen_wts.split(',')]
+    # 生成阶段 gen_on_valid为false
+    if args.gen_on_valid:
+        for i in xrange(len(corpus.valid)):
+            if i > 2:
+                break
+            x, _, src, locs, inps = corpus.valid[i]
+            seqlen, bsz = x.size()
+            #nfields = src.size(1)
+            # get bsz x nfields, bsz x nfields masks
+            #fmask, amask = make_masks(src, saved_args.pad_idx, max_pool=saved_args.max_pool)
+            #if args.cuda:
+                #src = src.cuda()
+                #amask = amask.cuda()
+
+            for b in xrange(bsz):
+                src_line = src_lines[corpus.val_mb2linenos[i][b]]
+                if "wiki" in args.data:
+                    src_tbl = get_wikibio_poswrds(src_line.strip().split())
+                else:
+                    src_tbl = get_e2e_poswrds(src_line.strip().split())
+
+                gen_from_srctbl(src_tbl, top_temps, coeffs, src_line=src_line)
+    else:
+        for ll, src_line in enumerate(src_lines):
+            if "wiki" in args.data:
+                src_tbl = get_wikibio_poswrds(src_line.strip().split())
+            else:
+                src_tbl = get_e2e_poswrds(src_line.strip().split())
+
+            gen_from_srctbl(src_tbl, top_temps, coeffs, src_line=src_line)
+
+def align_stuff():
+    from template_extraction import extract_from_tagged_data
+    i2w = corpus.dictionary.idx2word
+    net.eval()
+    cop_counters = [Counter() for _ in xrange(net.K*net.Kmul)]
+    net.ar = saved_args.ar_after_decay and not args.no_ar_for_vit
+    top_temps, _, _ = extract_from_tagged_data(args.data, args.bsz, args.thresh,
+                                               args.tagged_fi, args.ntemplates)
+    top_temps = set(temp for temp in top_temps)
+
+    with open(os.path.join(args.data, "train.txt")) as f:
+        tgtlines = [line.strip().split() for line in f]
+
+    with open(os.path.join(args.data, "src_train.txt")) as f:
+        srclines = [line.strip().split() for line in f]
+
+    assert len(srclines) == len(tgtlines)
+
+    for i in xrange(len(corpus.train)):
+        x, _, src, locs, inps = corpus.train[i]
+        fwd_cidxs = None
+
+        seqlen, bsz = x.size()
+        nfields = src.size(1)
+        if seqlen <= saved_args.L or seqlen > args.max_seqlen:
+            continue
+
+        combotargs = make_combo_targs(locs, x, saved_args.L, nfields, corpus.ngen_types)
+        # get bsz x nfields, bsz x nfields masks
+        fmask, amask = make_masks(src, saved_args.pad_idx, max_pool=saved_args.max_pool)
+        uniqfields = get_uniq_fields(src, args.pad_idx) # bsz x max_fields
+
+        if args.cuda:
+            combotargs = combotargs.cuda()
+            src = src.cuda()
+            inps = inps.cuda()
+            fmask, amask = fmask.cuda(), amask.cuda()
+            uniqfields = uniqfields.cuda()
+
+        srcenc, srcfieldenc, uniqenc = net.encode(Variable(src, volatile=True), # bsz x hid
+                                                  Variable(amask, volatile=True),
+                                                  Variable(uniqfields, volatile=True))
+        init_logps, trans_logps = net.trans_logprobs(uniqenc, seqlen) # bsz x K, T-1 x bsz x KxK
+        len_logprobs, _ = net.len_logprobs()
+        fwd_obs_logps = net.obs_logprobs(Variable(inps, volatile=True), srcenc,
+                                         srcfieldenc, Variable(fmask, volatile=True),
+                                         Variable(combotargs, volatile=True), bsz) # LxTxbsz x K
+        bwd_obs_logprobs = infc.bwd_from_fwd_obs_logprobs(fwd_obs_logps.data)
+        seqs = infc.viterbi(init_logps.data, trans_logps.data, bwd_obs_logprobs,
+                            [t.data for t in len_logprobs], constraints=fwd_cidxs)
+        # get rid of stuff not in our top_temps
+        for bidx in xrange(bsz):
+            if tuple(labe for (start, end, labe) in seqs[bidx]) in top_temps:
+                lineno = corpus.train_mb2linenos[i][bidx]
+                tgttokes = tgtlines[lineno]
+                if "wiki" in args.data:
+                    src_tbl = get_wikibio_poswrds(srclines[lineno])
+                else:
+                    src_tbl = get_e2e_poswrds(srclines[lineno]) # field, idx -> wrd
+                wrd2fields = defaultdict(list)
+                for (field, idx), wrd in src_tbl.iteritems():
+                    wrd2fields[wrd].append(field)
+                for (start, end, labe) in seqs[bidx]:
+                    for wrd in tgttokes[start:end]:
+                        if wrd in wrd2fields:
+                            cop_counters[labe].update(wrd2fields[wrd])
+                        else:
+                            cop_counters[labe]["other"] += 1
+
+    return cop_counters
+
+def init():
+
+    parser = argparse.ArgumentParser(description='')
+    parser.add_argument('-data', type=str, default='', help='path to data dir')
+    parser.add_argument('-epochs', type=int, default=40, help='upper epoch limit')
+    parser.add_argument('-bsz', type=int, default=16, help='batch size')
+    parser.add_argument('-seed', type=int, default=1111, help='random seed')
+    parser.add_argument('-cuda', action='store_true', help='use CUDA')
+    parser.add_argument('-log_interval', type=int, default=200,
+                        help='minibatches to wait before logging training status')
+    parser.add_argument('-save', type=str, default='', help='path to save the final model')
+    parser.add_argument('-load', type=str, default='', help='path to saved model')
+    parser.add_argument('-test', action='store_true', help='use test data')
+    parser.add_argument('-thresh', type=int, default=9, help='prune if occurs <= thresh')
+    parser.add_argument('-max_mbs_per_epoch', type=int, default=35000, help='max minibatches per epoch')
+
+    parser.add_argument('-emb_size', type=int, default=100, help='size of word embeddings')
+    parser.add_argument('-hid_size', type=int, default=100, help='size of rnn hidden state')
+    parser.add_argument('-layers', type=int, default=1, help='num rnn layers')
+    parser.add_argument('-A_dim', type=int, default=64,
+                        help='dim of factors if factoring transition matrix')
+    parser.add_argument('-cond_A_dim', type=int, default=32,
+                        help='dim of factors if factoring transition matrix')
+    parser.add_argument('-smaller_cond_dim', type=int, default=64,
+                        help='dim of thing we feed into linear to get transitions')
+    parser.add_argument('-yes_self_trans', action='store_true', help='')
+    parser.add_argument('-mlpinp', action='store_true', help='')
+    parser.add_argument('-mlp_sz_mult', type=int, default=2, help='mlp hidsz is this x emb_size')
+    parser.add_argument('-max_pool', action='store_true', help='for word-fields')
+
+    parser.add_argument('-constr_tr_epochs', type=int, default=100, help='')
+    parser.add_argument('-no_ar_epochs', type=int, default=100, help='')
+
+    parser.add_argument('-word_ar', action='store_true', help='')
+    parser.add_argument('-ar_after_decay', action='store_true', help='')
+    parser.add_argument('-no_ar_for_vit', action='store_true', help='')
+    parser.add_argument('-fine_tune', action='store_true', help='only train ar rnn')
+
+    parser.add_argument('-dropout', type=float, default=0.3, help='dropout')
+    parser.add_argument('-emb_drop', action='store_true', help='dropout on embeddings')
+    parser.add_argument('-lse_obj', action='store_true', help='')
+    parser.add_argument('-sep_attn', action='store_true', help='')
+    parser.add_argument('-max_seqlen', type=int, default=70, help='')
+
+    parser.add_argument('-K', type=int, default=10, help='number of states')
+    parser.add_argument('-Kmul', type=int, default=1, help='number of states multiplier')
+    parser.add_argument('-L', type=int, default=10, help='max segment length')
+    parser.add_argument('-unif_lenps', action='store_true', help='')
+    parser.add_argument('-one_rnn', action='store_true', help='')
+
+    parser.add_argument('-initrange', type=float, default=0.1, help='uniform init interval')
+    parser.add_argument('-lr', type=float, default=1.0, help='initial learning rate')
+    parser.add_argument('-lr_decay', type=float, default=0.5, help='learning rate decay')
+    parser.add_argument('-optim', type=str, default="sgd", help='optimization algorithm')
+    parser.add_argument('-onmt_decay', action='store_true', help='')
+    parser.add_argument('-clip', type=float, default=5, help='gradient clipping')
+    parser.add_argument('-interactive', action='store_true', help='')
+    parser.add_argument('-label_train', action='store_true', help='')
+    parser.add_argument('-gen_from_fi', type=str, default='', help='')
+    parser.add_argument('-verbose', action='store_true', help='')
+    parser.add_argument('-prev_loss', type=float, default=None, help='')
+    parser.add_argument('-best_loss', type=float, default=None, help='')
+
+    parser.add_argument('-tagged_fi', type=str, default='', help='path to tagged fi')
+    parser.add_argument('-ntemplates', type=int, default=200, help='num templates for gen')
+    parser.add_argument('-beamsz', type=int, default=1, help='')
+    parser.add_argument('-gen_wts', type=str, default='1,1', help='')
+    parser.add_argument('-min_gen_tokes', type=int, default=0, help='')
+    parser.add_argument('-min_gen_states', type=int, default=0, help='')
+    parser.add_argument('-gen_on_valid', action='store_true', help='')
+    parser.add_argument('-align', action='store_true', help='')
+    parser.add_argument('-wid_workers', type=str, default='', help='')
+    return parser.parse_args()
 
 if __name__ == "__main__":
-    args = parser.parse_args()
-    print args
+    args = init()
+    # print args
 
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
@@ -945,6 +1421,7 @@ if __name__ == "__main__":
     corpus = labeled_data.SentenceCorpus(args.data, args.bsz, thresh=args.thresh, add_bos=False,
                                      add_eos=False, test=args.test)
 
+    # 生成阶段 interactive是false，label_train 是false，gen_from_fi不为空
     if not args.interactive and not args.label_train and len(args.gen_from_fi) == 0:
         # make constraint things from labels
         train_cidxs, train_fwd_cidxs = [], []
@@ -954,9 +1431,11 @@ if __name__ == "__main__":
             train_fwd_cidxs.append(make_fwd_constr_idxs(args.L, x.size(0), constrs))
 
     saved_args, saved_state = None, None
+    # 生成阶段 load不为空
     if len(args.load) > 0:
-        saved_stuff = torch.load(args.load)
+        saved_stuff = torch.load(args.load, map_location='cpu')
         saved_args, saved_state = saved_stuff["opt"], saved_stuff["state_dict"]
+        print 'saved_args: {}'.format(str(saved_args))
         for k, v in args.__dict__.iteritems():
             if k not in saved_args.__dict__:
                 saved_args.__dict__[k] = v
@@ -965,12 +1444,14 @@ if __name__ == "__main__":
         del saved_state["selfmask"]
         net.load_state_dict(saved_state, strict=False)
         args.pad_idx = corpus.dictionary.word2idx["<pad>"]
+        # 生成阶段 false
         if args.fine_tune:
             for name, param in net.named_parameters():
                 if name in saved_state:
                     param.requires_grad = False
 
     else:
+        print 'saved_args not exists for none arg.load'
         args.pad_idx = corpus.dictionary.word2idx["<pad>"]
         net = HSMM(len(corpus.dictionary), corpus.ngen_types, args)
 
@@ -987,393 +1468,17 @@ if __name__ == "__main__":
     elif args.optim == "adam":
         optalg = optim.Adam(filter(lambda p: p.requires_grad, net.parameters()), lr=args.lr)
     else:
+        # 生成阶段
         optalg = None
-
-    def train(epoch):
-        # Turn on training mode which enables dropout.
-        net.train()
-        neglogev = 0.0 #  negative log evidence
-        nsents = 0
-        trainperm = torch.randperm(len(corpus.train))
-        nmini_batches = min(len(corpus.train), args.max_mbs_per_epoch)
-        for batch_idx in xrange(nmini_batches):
-            net.zero_grad()
-            x, _, src, locs, inps = corpus.train[trainperm[batch_idx]]
-            cidxs = train_cidxs[trainperm[batch_idx]] if epoch <= args.constr_tr_epochs else None
-
-            seqlen, bsz = x.size()
-            nfields = src.size(1)
-            if seqlen < args.L or seqlen > args.max_seqlen:
-                continue
-
-            combotargs = make_combo_targs(locs, x, args.L, nfields, corpus.ngen_types)
-            # get bsz x nfields, bsz x nfields masks
-            fmask, amask = make_masks(src, args.pad_idx, max_pool=args.max_pool)
-
-            uniqfields = get_uniq_fields(src, args.pad_idx) # bsz x max_fields
-
-            if args.cuda:
-                combotargs = combotargs.cuda()
-                if cidxs is not None:
-                    cidxs = [tens.cuda() if tens is not None else None for tens in cidxs]
-                src = src.cuda()
-                inps = inps.cuda()
-                fmask, amask = fmask.cuda(), amask.cuda()
-                uniqfields = uniqfields.cuda()
-
-            srcenc, srcfieldenc, uniqenc = net.encode(Variable(src), Variable(amask), # bsz x hid
-                                                      Variable(uniqfields))
-            init_logps, trans_logps = net.trans_logprobs(uniqenc, seqlen) # bsz x K, T-1 x bsz x KxK
-            len_logprobs, _ = net.len_logprobs()
-            fwd_obs_logps = net.obs_logprobs(Variable(inps), srcenc, srcfieldenc, Variable(fmask),
-                                             Variable(combotargs), bsz) # L x T x bsz x K
-            # get T+1 x bsz x K beta quantities
-            beta, beta_star = infc.just_bwd(trans_logps, fwd_obs_logps,
-                                            len_logprobs, constraints=cidxs)
-            log_marg = logsumexp1(beta_star[0] + init_logps).sum() # bsz x 1 -> 1
-            neglogev -= log_marg.data[0]
-            lossvar = -log_marg/bsz
-            lossvar.backward()
-            torch.nn.utils.clip_grad_norm(net.parameters(), args.clip)
-            if optalg is not None:
-                optalg.step()
-            else:
-                for p in net.parameters():
-                    if p.grad is not None:
-                        p.data.add_(-args.lr, p.grad.data)
-
-            nsents += bsz
-
-            if (batch_idx+1) % args.log_interval == 0:
-                print "batch %d/%d | train neglogev %g " % (batch_idx+1,
-                                                            nmini_batches,
-                                                            neglogev/nsents)
-        print "epoch %d | train neglogev %g " % (epoch, neglogev/nsents)
-        return neglogev/nsents
-
-    def test(epoch):
-        net.eval()
-        neglogev = 0.0
-        nsents = 0
-
-        for i in xrange(len(corpus.valid)):
-            x, _, src, locs, inps = corpus.valid[i]
-            cidxs = None
-
-            seqlen, bsz = x.size()
-            nfields = src.size(1)
-            if seqlen < args.L or seqlen > args.max_seqlen:
-                continue
-
-            combotargs = make_combo_targs(locs, x, args.L, nfields, corpus.ngen_types)
-            # get bsz x nfields, bsz x nfields masks
-            fmask, amask = make_masks(src, args.pad_idx, max_pool=args.max_pool)
-
-            uniqfields = get_uniq_fields(src, args.pad_idx) # bsz x max_fields
-
-            if args.cuda:
-                combotargs = combotargs.cuda()
-                if cidxs is not None:
-                    cidxs = [tens.cuda() if tens is not None else None for tens in cidxs]
-                src = src.cuda()
-                inps = inps.cuda()
-                fmask, amask = fmask.cuda(), amask.cuda()
-                uniqfields = uniqfields.cuda()
-
-            srcenc, srcfieldenc, uniqenc = net.encode(Variable(src, volatile=True),  # bsz x hid
-                                                      Variable(amask, volatile=True),
-                                                      Variable(uniqfields, volatile=True))
-            init_logps, trans_logps = net.trans_logprobs(uniqenc, seqlen) # bsz x K, T-1 x bsz x KxK
-            len_logprobs, _ = net.len_logprobs()
-            fwd_obs_logps = net.obs_logprobs(Variable(inps, volatile=True), srcenc,
-                                             srcfieldenc, Variable(fmask, volatile=True),
-                                             Variable(combotargs, volatile=True),
-                                             bsz) # L x T x bsz x K
-
-            # get T+1 x bsz x K beta quantities
-            beta, beta_star = infc.just_bwd(trans_logps, fwd_obs_logps,
-                                            len_logprobs, constraints=cidxs)
-            log_marg = logsumexp1(beta_star[0] + init_logps).sum() # bsz x 1 -> 1
-            neglogev -= log_marg.data[0]
-            nsents += bsz
-        print "epoch %d | valid ev %g" % (epoch, neglogev/nsents)
-        return neglogev/nsents
-
-    def label_train():
-        net.ar = saved_args.ar_after_decay and not args.no_ar_for_vit
-        print "btw, net.ar:", net.ar
-        for i in xrange(len(corpus.train)):
-            x, _, src, locs, inps = corpus.train[i]
-            fwd_cidxs = None
-
-            seqlen, bsz = x.size()
-            nfields = src.size(1)
-            if seqlen <= saved_args.L: #or seqlen > args.max_seqlen:
-                continue
-
-            combotargs = make_combo_targs(locs, x, saved_args.L, nfields, corpus.ngen_types)
-            # get bsz x nfields, bsz x nfields masks
-            fmask, amask = make_masks(src, saved_args.pad_idx, max_pool=saved_args.max_pool)
-            uniqfields = get_uniq_fields(src, args.pad_idx) # bsz x max_fields
-
-            if args.cuda:
-                combotargs = combotargs.cuda()
-                if fwd_cidxs is not None:
-                    fwd_cidxs = [tens.cuda() if tens is not None else None for tens in fwd_cidxs]
-                src = src.cuda()
-                inps = inps.cuda()
-                fmask, amask = fmask.cuda(), amask.cuda()
-                uniqfields = uniqfields.cuda()
-
-            srcenc, srcfieldenc, uniqenc = net.encode(Variable(src, volatile=True), # bsz x hid
-                                                      Variable(amask, volatile=True),
-                                                      Variable(uniqfields, volatile=True))
-            init_logps, trans_logps = net.trans_logprobs(uniqenc, seqlen) # bsz x K, T-1 x bsz x KxK
-            len_logprobs, _ = net.len_logprobs()
-            fwd_obs_logps = net.obs_logprobs(Variable(inps, volatile=True), srcenc,
-                                             srcfieldenc, Variable(fmask, volatile=True),
-                                             Variable(combotargs, volatile=True), bsz) # LxTxbsz x K
-            bwd_obs_logprobs = infc.bwd_from_fwd_obs_logprobs(fwd_obs_logps.data)
-            seqs = infc.viterbi(init_logps.data, trans_logps.data, bwd_obs_logprobs,
-                                [t.data for t in len_logprobs], constraints=fwd_cidxs)
-            for b in xrange(bsz):
-                words = [corpus.dictionary.idx2word[w] for w in x[:, b]]
-                for (start, end, label) in seqs[b]:
-                    print "%s|%d" % (" ".join(words[start:end]), label),
-                print
-
-    def gen_from_srctbl(src_tbl, top_temps, coeffs, src_line=None):
-        net.ar = saved_args.ar_after_decay
-        #print "btw2", net.ar
-        i2w, w2i = corpus.dictionary.idx2word, corpus.dictionary.word2idx
-        best_score, best_phrases, best_templt = -float("inf"), None, None
-        best_len = 0
-        best_tscore, best_gscore = None, None
-
-        # get srcrow 2 key, idx
-        #src_b = src.narrow(0, b, 1) # 1 x nfields x nfeats
-        src_b = corpus.featurize_tbl(src_tbl).unsqueeze(0) # 1 x nfields x nfeats
-        uniq_b = get_uniq_fields(src_b, saved_args.pad_idx) # 1 x max_fields
-        if args.cuda:
-            src_b = src_b.cuda()
-            uniq_b = uniq_b.cuda()
-
-        srcenc, srcfieldenc, uniqenc = net.encode(Variable(src_b, volatile=True), None,
-                                                  Variable(uniq_b, volatile=True))
-        init_logps, trans_logps = net.trans_logprobs(uniqenc, 2)
-        _, len_scores = net.len_logprobs()
-        len_lps = net.lsm(len_scores).data
-        init_logps, trans_logps = init_logps.data.cpu(), trans_logps.data[0].cpu()
-        inits = net.h0_lin(srcenc)
-        h0, c0 = F.tanh(inits[:, :inits.size(1)/2]), inits[:, inits.size(1)/2:]
-
-        nfields = src_b.size(1)
-        row2tblent = {}
-        for ff in xrange(nfields):
-            field, idx = i2w[src_b[0][ff][0]], i2w[src_b[0][ff][1]]
-            if (field, idx) in src_tbl:
-                row2tblent[ff] = (field, idx, src_tbl[field, idx])
-            else:
-                row2tblent[ff] = (None, None, None)
-
-        # get row to input feats
-        row2feats = {}
-        # precompute wrd stuff
-        fld_cntr = Counter([key for key, _ in src_tbl])
-        for row, (k, idx, wrd) in row2tblent.iteritems():
-            if k in w2i:
-                widx = w2i[wrd] if wrd in w2i else w2i["<unk>"]
-                keyidx = w2i[k] if k in w2i else w2i["<unk>"]
-                idxidx = w2i[idx]
-                cheatfeat = w2i["<stop>"] if fld_cntr[k] == idx else w2i["<go>"]
-                #row2feats[row] = torch.LongTensor([keyidx, idxidx, cheatfeat])
-                row2feats[row] = torch.LongTensor([widx, keyidx, idxidx, cheatfeat])
-
-        constr_sat = False
-        # search over all templates
-        for templt in top_temps:
-            #print "templt is", templt
-            # get templt transition prob
-            tscores = [init_logps[0][templt[0]]]
-            [tscores.append(trans_logps[0][templt[tt-1]][templt[tt]])
-             for tt in xrange(1, len(templt))]
-
-            if net.ar:
-                phrases, wscore, tokes = net.gen_one_ar(templt, h0[0], c0[0], srcfieldenc,
-                    len_lps, row2tblent, row2feats)
-                rul_tokes = tokes
-            else:
-                phrases, wscore, lscore, tokes, segs = net.gen_one(templt, h0[0], c0[0],
-                    srcfieldenc, len_lps, row2tblent, row2feats)
-                rul_tokes = tokes - segs # subtract imaginary toke for each <eop>
-                wscore /= tokes
-            segs = len(templt)
-            if (rul_tokes < args.min_gen_tokes or segs < args.min_gen_states) and constr_sat:
-                continue
-            if rul_tokes >= args.min_gen_tokes and segs >= args.min_gen_states:
-                constr_sat = True # satisfied our constraint
-            tscore = sum(tscores[:int(segs)])/segs
-            if not net.unif_lenps:
-                tscore += lscore/segs
-
-            gscore = wscore
-            ascore = coeffs[0]*tscore + coeffs[1]*gscore
-            if (constr_sat and ascore > best_score) or (not constr_sat and rul_tokes > best_len) or (not constr_sat and rul_tokes == best_len and ascore > best_score):
-            # take if improves score or not long enough yet and this is longer...
-            #if ascore > best_score: #or (not constr_sat and rul_tokes > best_len):
-                best_score, best_tscore, best_gscore = ascore, tscore, gscore
-                best_phrases, best_templt = phrases, templt
-                best_len = rul_tokes
-            #str_phrases = [" ".join(phrs) for phrs in phrases]
-            #tmpltd = ["%s|%d" % (phrs, templt[k]) for k, phrs in enumerate(str_phrases)]
-            #statstr = "a=%.2f t=%.2f g=%.2f" % (ascore, tscore, gscore)
-            #print "%s|||%s" % (" ".join(str_phrases), " ".join(tmpltd)), statstr
-            #assert False
-        #assert False
-
-        try:
-            str_phrases = [" ".join(phrs) for phrs in best_phrases]
-        except TypeError:
-            # sometimes it puts an actual number in
-            str_phrases = [" ".join([str(n) if type(n) is int else n for n in phrs]) for phrs in best_phrases]
-        tmpltd = ["%s|%d" % (phrs, best_templt[kk]) for kk, phrs in enumerate(str_phrases)]
-        if args.verbose:
-            print src_line
-            #print src_tbl
-
-        print "%s|||%s" % (" ".join(str_phrases), " ".join(tmpltd))
-        if args.verbose:
-            statstr = "a=%.2f t=%.2f g=%.2f" % (best_score, best_tscore, best_gscore)
-            print statstr
-            print
-        #assert False
-
-    def gen_from_src():
-        from template_extraction import extract_from_tagged_data, align_cntr
-        top_temps, _, _ = extract_from_tagged_data(args.data, args.bsz, args.thresh,
-                                                   args.tagged_fi, args.ntemplates)
-
-        with open(args.gen_from_fi) as f:
-            src_lines = f.readlines()
-
-        if len(args.wid_workers) > 0:
-            wid, nworkers = [int(n.strip()) for n in args.wid_workers.split(',')]
-            chunksz = math.floor(len(src_lines)/float(nworkers))
-            startln = int(wid*chunksz)
-            endln = int((wid+1)*chunksz) if wid < nworkers-1 else len(src_lines)
-            print >> sys.stderr, "worker", wid, "doing lines", startln, "thru", endln-1
-            src_lines = src_lines[startln:endln]
-
-        net.eval()
-        coeffs = [float(flt.strip()) for flt in args.gen_wts.split(',')]
-        if args.gen_on_valid:
-            for i in xrange(len(corpus.valid)):
-                if i > 2:
-                    break
-                x, _, src, locs, inps = corpus.valid[i]
-                seqlen, bsz = x.size()
-                #nfields = src.size(1)
-                # get bsz x nfields, bsz x nfields masks
-                #fmask, amask = make_masks(src, saved_args.pad_idx, max_pool=saved_args.max_pool)
-                #if args.cuda:
-                    #src = src.cuda()
-                    #amask = amask.cuda()
-
-                for b in xrange(bsz):
-                    src_line = src_lines[corpus.val_mb2linenos[i][b]]
-                    if "wiki" in args.data:
-                        src_tbl = get_wikibio_poswrds(src_line.strip().split())
-                    else:
-                        src_tbl = get_e2e_poswrds(src_line.strip().split())
-
-                    gen_from_srctbl(src_tbl, top_temps, coeffs, src_line=src_line)
-        else:
-            for ll, src_line in enumerate(src_lines):
-                if "wiki" in args.data:
-                    src_tbl = get_wikibio_poswrds(src_line.strip().split())
-                else:
-                    src_tbl = get_e2e_poswrds(src_line.strip().split())
-
-                gen_from_srctbl(src_tbl, top_temps, coeffs, src_line=src_line)
-
-
-    def align_stuff():
-        from template_extraction import extract_from_tagged_data
-        i2w = corpus.dictionary.idx2word
-        net.eval()
-        cop_counters = [Counter() for _ in xrange(net.K*net.Kmul)]
-        net.ar = saved_args.ar_after_decay and not args.no_ar_for_vit
-        top_temps, _, _ = extract_from_tagged_data(args.data, args.bsz, args.thresh,
-                                                   args.tagged_fi, args.ntemplates)
-        top_temps = set(temp for temp in top_temps)
-
-        with open(os.path.join(args.data, "train.txt")) as f:
-            tgtlines = [line.strip().split() for line in f]
-
-        with open(os.path.join(args.data, "src_train.txt")) as f:
-            srclines = [line.strip().split() for line in f]
-
-        assert len(srclines) == len(tgtlines)
-
-        for i in xrange(len(corpus.train)):
-            x, _, src, locs, inps = corpus.train[i]
-            fwd_cidxs = None
-
-            seqlen, bsz = x.size()
-            nfields = src.size(1)
-            if seqlen <= saved_args.L or seqlen > args.max_seqlen:
-                continue
-
-            combotargs = make_combo_targs(locs, x, saved_args.L, nfields, corpus.ngen_types)
-            # get bsz x nfields, bsz x nfields masks
-            fmask, amask = make_masks(src, saved_args.pad_idx, max_pool=saved_args.max_pool)
-            uniqfields = get_uniq_fields(src, args.pad_idx) # bsz x max_fields
-
-            if args.cuda:
-                combotargs = combotargs.cuda()
-                src = src.cuda()
-                inps = inps.cuda()
-                fmask, amask = fmask.cuda(), amask.cuda()
-                uniqfields = uniqfields.cuda()
-
-            srcenc, srcfieldenc, uniqenc = net.encode(Variable(src, volatile=True), # bsz x hid
-                                                      Variable(amask, volatile=True),
-                                                      Variable(uniqfields, volatile=True))
-            init_logps, trans_logps = net.trans_logprobs(uniqenc, seqlen) # bsz x K, T-1 x bsz x KxK
-            len_logprobs, _ = net.len_logprobs()
-            fwd_obs_logps = net.obs_logprobs(Variable(inps, volatile=True), srcenc,
-                                             srcfieldenc, Variable(fmask, volatile=True),
-                                             Variable(combotargs, volatile=True), bsz) # LxTxbsz x K
-            bwd_obs_logprobs = infc.bwd_from_fwd_obs_logprobs(fwd_obs_logps.data)
-            seqs = infc.viterbi(init_logps.data, trans_logps.data, bwd_obs_logprobs,
-                                [t.data for t in len_logprobs], constraints=fwd_cidxs)
-            # get rid of stuff not in our top_temps
-            for bidx in xrange(bsz):
-                if tuple(labe for (start, end, labe) in seqs[bidx]) in top_temps:
-                    lineno = corpus.train_mb2linenos[i][bidx]
-                    tgttokes = tgtlines[lineno]
-                    if "wiki" in args.data:
-                        src_tbl = get_wikibio_poswrds(srclines[lineno])
-                    else:
-                        src_tbl = get_e2e_poswrds(srclines[lineno]) # field, idx -> wrd
-                    wrd2fields = defaultdict(list)
-                    for (field, idx), wrd in src_tbl.iteritems():
-                        wrd2fields[wrd].append(field)
-                    for (start, end, labe) in seqs[bidx]:
-                        for wrd in tgttokes[start:end]:
-                            if wrd in wrd2fields:
-                                cop_counters[labe].update(wrd2fields[wrd])
-                            else:
-                                cop_counters[labe]["other"] += 1
-
-        return cop_counters
-
+    # 生成阶段interactive是false    
     if args.interactive:
         pass
+    # 生成阶段align是false
     elif args.align:
         from utils import calc_pur
         cop_counters = align_stuff()
         calc_pur(cop_counters)
+    # 生成阶段是false
     elif args.label_train:
         net.eval()
         label_train()
