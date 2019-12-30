@@ -1,0 +1,5 @@
+('_area', 2)
+('_food', 1)
+('_eatType', 1)
+('_area', 1)
+('_name', 1)
