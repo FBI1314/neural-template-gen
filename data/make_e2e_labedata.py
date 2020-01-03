@@ -17,9 +17,17 @@ def get_first_sent_tokes(tokes):
     except ValueError:
         return tokes
 
-def stupid_search(tokes, fields):
-    """
-    greedily assigns longest labels to spans from left to right
+def  (tokes, fields):
+    """找到target和src中完全一样的单词。
+    Return:
+        labels: list of tuple. 每一个tuple的第三项是属性，第一项和第二项是属性值的索引。
+    比如src:__start_name__ The Vaults __end_name__ __start_eatType__ pub __end_eatType__ __start_priceRange__ more than £ 30 __end_priceRange__ __start_customerrating__ 5 out of 5 __end_customerrating__ __start_near__ Café Adriatic __end_near__
+    有字段'customerrating'、'eatType'、 'name'、'near'、'priceRange' 
+    target中的文本The Vaults pub near Café Adriatic has a 5 star rating . Prices start at £ 30 .
+    
+    只有'name'-The Vaults、'eatType'-pub和 'near'-Café Adriatic
+    
+    那么结果[(0, 2, idx('name')), (2, 3, idx('eatType')), (4, 6, idx('near')), (11, 12, idx('unknow')), (17, 18, idx('unknow'))]
     """
     labels = []
     i = 0
